@@ -14,47 +14,60 @@ Functions also lack access to customizable hardware, notably GPUs, which limit t
 
 As guidance, the authors offer suggestions for improving serverless functions by addressing their aforementioned concerns. Most clearly beneficial is to establish some method of persisting resources with known identities between application elements with affinities for one another (though not _explicitly_ defined, I interpret "affinities" in this context to refer to repeated connections between certain elements, i.e. a function accessing a specific database on every invocation, or running on a certain hardware element repeatedly), which can scale and remap across physical resources rapidly and efficiently to accomodate for the virtualized environment. Additionally, methods of colocating data and code would be beneficial--while issues will innevitably arise due to the medium of virtualized software, reducing the amount of networked connections between resources and instead "bringing the code to data" will reduce overall latency significantly. Addressing the limitations on hardware would further open up serveless functions to additional use cases, particularly those which require hardware acceleration or GPUs.[1]
 
+
 ### Part 2. Azure Durable Functions Deep-Dive
 #### 2.2. Orchestration model
-***How do orchestrator, activity, and client functions work together? How does this differ from basic FaaS?
-
 The orchestration model is an architecture provided by Azure Durable Functions (ADF) which partitions functions into three types--orchestrators, activity, and client. The process of an application's execution begins with a client function, the entry point into a larger application. Any non-orchestrator function can be a client function. [2] An orchestrator function contains logic for calling additional functions, as well as managing the state of a workflow. Activity functions are those which perform individual tasks (single units of work) and can be executed in series, in parallel, or in any combination of the two, and allow for much longer running, complex architectures than those allowed by basic functions.
 
 In comparison, basic functions lack this diversification and can only execute in series. The lack of types of functions mean that every basic function is essentially an activity function performing small units of work one after the other, communicating through reads and writes to shared data resources.
 
 #### 2.3. State management
-***How does Durable Functions manage state (event sourcing, checkpointing, replay)? How does this address the paper's criticism that functions are stateless?
-
 Azure Durable Functions manage state through the use of persistent storage. Starting an ADF creates an append-only storage table named (by default) DurableFunctionsHubHistory that records the execution state and events throughout the lifetime of an ADF workflow. The use of a storage table recording events is also the method through which checkpointing is achieved--recording state at every await()/yield() call such that in the event of a failure, the orchestrator can retry from the state of the last successful function execution[3]. Here is where idempotency is important; as activity functions have an "at least once" execution guarantee, it is possible for any individual activity function to execute multiple times, which can cause cascading errors when not designed with multiple executions in mind[4] (for example: In a workflow processing a user's order on a website, a network issue causes the activity function that handles charging the user's card executes several times as the orchestrator has to retry from a checkpoint--without logic to accomodate this, the user will be charged for each execution).
 
 This method addresses Hellerstein et al.'s criticisms regarding statelessness relying on expensive reads and writes to an intermediary storage account. By using an inexpensive append-only table, expensive data access operations can be saved for necessary cases rather than relying on them as a shoddy replacement for more effective state management.
 
 #### 2.4. Execution timeouts
-*** How do orchestrators bypass the timeout limits that apply to regular Azure Functions? What limits still apply to activity functions?
-
 The use of stateful storage by ADF is the method through which orchestrators bypass the time limits applied to typical functions. Orchestrators can use a durable timer to checkpoint its state to persistent storage and then terminate. On reset of the timer, the function is called again and resumes where it left off based on the events recorded in the previous execution [5]. Activity functions, however, are still subject to the typical expiration limits depending on their consumption plan.
 
 #### 2.5. Communication between functions
-*** How do orchestrator and activity functions communicate? Does this address the paper's criticism about functions needing slow storage intermediaries?
-
 ADF notably do not solve the lack of direct network addressability between functions. In place of direct communication, ADF use task hubs. However, they improve upon the communication model of typical functions through use of a Task Hub, a queue-like data store that manages the table of execution history and checkpointing, as well as messages being passed between functions. Depending on the storage provider, task hubs can be represented in storage differently, with options available depending on the needs of the application [6].
 
-#### 2.6. Parallel execution (fan-out/fan-in)
-*** How does the fan-out/fan-in pattern work? How does it address the paper's concern about distributed computing?
+The issue remains of functions lacking addressability, and therefore the criticism of slow storage intermediaries remains partially unaddressed. The use of a task hub and enqueueing messages does save time, though reliance on any form of blob storage is generally a poor choice when speed is important.
 
-Fan-out/fan-in in an architectural pattern that can be used in a ADF for the parallel execution of functions. Multiple function instances can be triggered at the same time by an orchestrator function, diverging to accomplish each unit of work independently ("fan-out"). The orchestrator waits on results to return from each activity function ("fan-in") before continuing
+#### 2.6. Parallel execution (fan-out/fan-in)
+Fan-out/fan-in in an architectural pattern that can be used in a ADF for the parallel execution of functions. Multiple function instances can be triggered at the same time by an orchestrator function, diverging to accomplish each unit of work independently ("fan-out"). The orchestrator waits on results to return from each activity function ("fan-in") before continuing. 
+
+Decoupling functions from a series-only model of execution through fan-out/fan-in mostly addresses the issues Hellerstein et al. highlight regarding functions' failure of embodying the principles of distributed computing--with the ability to execute in parallel and communicate through queued messages predominantly coordinated by a Task Hub rather than arduous reads and writes to a storage account, ADF partly achieve proper use of distributed computing resources though parallel execution. However, the reliance on any form of persistent storage, even just for checkpointing, highlights that ADFs are not quite a truly distributed process.
+
 
 ### Part 3. Critical Evaluation
 #### 3.1. Limitations that remain unresolved
+Significant advancements have been made between the time of the paper's publishing and the creation of Azure Durable Functions (ADFs), most notably in the diversification of function types to better take advantage of the benefits of distributed computing. With client, orchestrator and activity functions to organize workflows, far more advanced sequences of functions can be strung together, with elements executing in parallel, series, or combinations of the two. However, despite the addition of a Task Hub to manage messages between functions, ADFs still remain dependent on storage services for state manegement, and as a result, more often than not fail to colocate data and code, resulting in high-latency bottlenecks and persitence of the "data-to-code" anti-pattern.
+
+Additionally, no notable progress has been made in the hardware options afforded to ADFs, with resources limited to generic CPUs and RAM with no possibility of accessing GPUs or enabling hardware acceleration. This limits the use cases for functions, and prevents data-intensive examples such as machine learning training from being able to reap the benefits of serverless computing.
+
+
 #### 3.2. Your Verdict
+_Serverless Computing: One Step Forward, Two Steps Back_ makes an excellent argument against serverless functions as the new foundation of cloud-native applications with a set of critiques that were, at the time of publishing, likely very poignant criticisms of the current state of the technology. However, over time new advancements have come along to advance functions generally in the right direction and making great progress in tackling the very criticisms highlighted by Hellerstein et al.
+
+Despite this, my belief is that the majority of the changes proposed by ADFs are simply workarounds for fundamental limitations that may never be resolved, only managed. The relationship between storage and compute is my primary concern when it comes to functions, which cannot be resolved without causing tangles elsewhere. Take for example, an ADF app which is triggered by an HTTP request to read data from a database and perform some operations on it. The workflow involves declaring, initializing and running these functions on some virtualized hardware elsewhere, likely far from the storage resource (and involving a hefty start up time if the VM is not pre-warmed). As a result, bandwidth is wasted with piles of data "shipped" to the code, and then I/O bottlenecks appear as the functions are forced to share the same outbound connection to return their processed data. The only real way to resolve this could be to have the function app pre-loaded "closer" to the data, on the same virtualized machine, which then eschews the definition of "serverless" by having an always-on instance of this application somewhere as a preventative to this anti-pattern rearing its head. There is simply no way to resolve this issue it can be managed through hacky fixes to bring code "closer" to data, but any significant progress to resolving it just ends up mimicking a typical stateful application.
+
+Then comes the issue of communication--ADFs still rely on persistent storage for communication between functions. This is slow, inefficient, and cannot be resolved without removing a core element of functions--their statelessness. As long as state management is done through storage, even though Task Hubs present options for purpose-specific storage, functions will be burdened by a  bottleneck in their communication.
+
+Regardless, ADFs still have their place. Lightweight applications may never run into issues of latency (provided they are not chaining into elaborate, branching paths that would be best to replace with something stateful). The low barrier to entry for functions also make their prime candidates for quick turnarounds from idea to prototype, with the complete lack of resource management a blessing for developers who seek to develop rather than faff around with configuring a server. Though some critiques by Hellerstein et al. will likely never be addressed in full, I believe that ADFs are a significant step to making functions the best they can be as serverless applications.
 
 ### Part 4. References
-[1] original paper go here
-[2] https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-types-features-overview
-[3] https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-orchestrations?tabs=csharp-inproc
-[4] https://www.linkedin.com/learning/learning-azure-durable-functions/introduction-to-durable-functions?u=2199673
-[5] https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-timers?tabs=csharp
-[6] https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-task-hubs?tabs=csharp
+[1] J. M. Hellerstein et al., “Serverless Computing: One Step Forward, Two Steps Back,” arXiv.org, Dec. 10, 2018. https://arxiv.org/abs/1812.03651
 
-### part 5. AI Disclosure
-No AI tools were used in this assignment, except for a few times when I Googled something and the AI overview included a link to an actual source.
+[2] cgillum, “Function types in Azure Durable Functions,” Microsoft.com, Jun. 17, 2022. https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-types-features-overview
+
+[3] cgillum, “Durable Orchestrations - Azure Functions,” Microsoft.com, Dec. 11, 2025. https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-orchestrations
+
+[4] A. Braganza Tacke, “Learning Azure Durable Functions - Introduction to Durable Functions,” Linkedin.com, 2026. https://www.linkedin.com/learning/learning-azure-durable-functions/introduction-to-durable-functions (accessed Feb. 10, 2026).
+
+[5] lilyjma, “Timers in Durable Functions - Azure,” Microsoft.com, Dec. 14, 2022. https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-timers (accessed Feb. 10, 2026).
+
+[6] cgillum, “Task hubs in Durable Functions - Azure,” Microsoft.com, May 04, 2023. https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-task-hubs
+
+### Part 5. AI Disclosure
+No AI tools were used in this assignment, except for a few times when I Googled something and the AI overview included a link to a proper source.
